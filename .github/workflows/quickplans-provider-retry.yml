@@ -1,0 +1,57 @@
+name: QuickPlans provider retry
+'on':
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+permissions: {}
+concurrency:
+  group: quickplans-provider-retry
+  cancel-in-progress: false
+jobs:
+  retry:
+    if: github.repository == 'alexsham2023/quick-reply-keyboard-support' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Invoke fixed bounded worker
+        env:
+          QUICKPLANS_WORKER_BEARER: ${{ secrets.QUICKPLANS_WORKER_BEARER }}
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set +x
+          if [[ ! "$QUICKPLANS_WORKER_BEARER" =~ ^qpw1_[A-Za-z0-9_-]{43}$ ]]; then
+            echo 'Dedicated worker credential unavailable.'
+            exit 1
+          fi
+          umask 077
+          response="$RUNNER_TEMP/quickplans-worker-response.json"
+          trap 'rm -f "$response"' EXIT
+          set +e
+          status=$(
+            printf 'url = "https://qzrnbdyuadmneyiuijet.supabase.co/functions/v1/quickplans-revoke-worker"\nrequest = "POST"\nheader = "Content-Type: application/json"\nheader = "Authorization: Bearer %s"\ndata = "{}"\n' "$QUICKPLANS_WORKER_BEARER" |
+            curl --disable --config - --silent --show-error --proto '=https' --tlsv1.2 --max-time 30 --max-redirs 0 --output "$response" --write-out '%{http_code}'
+          )
+          transport=$?
+          set -e
+          unset QUICKPLANS_WORKER_BEARER
+          if [[ "$transport" != 0 || "$status" != 200 ]]; then
+            echo "Worker invocation failed (curl=$transport, HTTP=$status)."
+            exit 1
+          fi
+          # Never print the response, identifiers, request headers or credentials.
+          python3 - "$response" <<'PY'
+          import json, pathlib, sys
+          try:
+              path = pathlib.Path(sys.argv[1])
+              if path.stat().st_size > 65536:
+                  raise ValueError()
+              result = json.loads(path.read_text())
+              rows = result.get('results')
+              if not isinstance(rows, list) or not 1 <= len(rows) <= 5:
+                  raise ValueError()
+              if any(not isinstance(row, dict) or row.get('state') not in ('idle', 'confirmed') for row in rows):
+                  raise ValueError()
+          except Exception:
+              print('Worker returned an unresolved or unexpected result; inspect account status privately.')
+              sys.exit(1)
+          print('Bounded worker invocation completed; this does not certify every provider revocation.')
+          PY
